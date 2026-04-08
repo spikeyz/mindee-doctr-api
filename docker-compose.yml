@@ -1,0 +1,42 @@
+services:
+  doctr-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # To build with CUDA wheels instead of CPU-only:
+      # args:
+      #   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu121
+    image: doctr-api:latest
+    container_name: doctr-api
+    ports:
+      - "8000:8000"
+    environment:
+      WORKERS: "2"
+      DOCTR_CACHE_DIR: /app/.cache/doctr
+    volumes:
+      # Persist downloaded model weights across container restarts
+      - doctr-model-cache:/app/.cache/doctr
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional: GPU-enabled service (requires nvidia-container-toolkit)
+  # doctr-api-gpu:
+  #   build:
+  #     context: .
+  #     args:
+  #       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu121
+  #   image: doctr-api-gpu:latest
+  #   runtime: nvidia
+  #   environment:
+  #     NVIDIA_VISIBLE_DEVICES: all
+  #     WORKERS: "1"
+  #   ports:
+  #     - "8001:8000"
+
+volumes:
+  doctr-model-cache:

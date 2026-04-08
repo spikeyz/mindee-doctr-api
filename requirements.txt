@@ -1,0 +1,6 @@
+python-doctr[torch,viz,html]==0.10.0
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+Pillow==10.4.0
+numpy==1.26.4
