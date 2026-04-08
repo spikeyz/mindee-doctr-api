@@ -1,5 +1,5 @@
 # Docker Image Repo
-(https://hub.docker.com/repository/docker/spikeyz/mindee-doctr-api)
+https://hub.docker.com/r/spikeyz/mindee-doctr-api
 
 # docTR REST API
 
