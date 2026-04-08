@@ -1,3 +1,6 @@
+# Docker Image Repo
+(https://hub.docker.com/repository/docker/spikeyz/mindee-doctr-api)
+
 # docTR REST API
 
 A Docker image that wraps [Mindee's docTR](https://github.com/mindee/doctr) library and exposes all its features through an HTTP REST API built with FastAPI.
