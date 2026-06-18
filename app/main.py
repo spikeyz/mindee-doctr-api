@@ -192,7 +192,7 @@ def health():
     if DEVICE.type == "cuda":
         gpu_info = {
             "gpu_name": torch.cuda.get_device_name(0),
-            "gpu_memory_total_mb": round(torch.cuda.get_device_properties(0).total_mem / 1e6),
+            "gpu_memory_total_mb": round(torch.cuda.get_device_properties(0).total_memory / 1e6),
         }
     return {"status": "ok", "device": str(DEVICE), **gpu_info}
 
