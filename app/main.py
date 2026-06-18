@@ -112,6 +112,9 @@ def _load_image_bytes(data: bytes) -> np.ndarray:
     return np.array(img)
 
 
+MAX_PAGE_PIXELS = 4_000_000  # ~2000×2000 – cap pour éviter les OOM sur PDFs vectoriels
+
+
 def _ensure_rgb(arr: np.ndarray) -> np.ndarray:
     """Convert a page array to RGB, compositing RGBA onto a white background."""
     img = Image.fromarray(arr)
@@ -124,6 +127,48 @@ def _ensure_rgb(arr: np.ndarray) -> np.ndarray:
     return np.array(img.convert("RGB"))
 
 
+def _cap_resolution(arr: np.ndarray) -> np.ndarray:
+    """Down-scale a page if it exceeds MAX_PAGE_PIXELS."""
+    h, w = arr.shape[:2]
+    pixels = h * w
+    if pixels <= MAX_PAGE_PIXELS:
+        return arr
+    ratio = (MAX_PAGE_PIXELS / pixels) ** 0.5
+    new_w, new_h = max(1, int(w * ratio)), max(1, int(h * ratio))
+    logger.info("Capping page resolution from %dx%d to %dx%d", w, h, new_w, new_h)
+    return np.array(Image.fromarray(arr).resize((new_w, new_h), Image.LANCZOS))
+
+
+def _read_pdf_safe(data: bytes) -> list[np.ndarray]:
+    """Read PDF pages with pypdfium2, falling back to Pillow on failure."""
+    import pypdfium2 as pdfium
+
+    pages: list[np.ndarray] = []
+    pdf = pdfium.PdfDocument(data)
+    try:
+        for i, page in enumerate(pdf):
+            try:
+                bitmap = page.render(scale=2, rev_byteorder=True)
+                arr = bitmap.to_numpy()
+            except Exception:
+                logger.warning("pypdfium2 render failed on page %d, falling back to Pillow", i)
+                arr = _render_page_pillow(data, i)
+            if arr is None or arr.size == 0:
+                raise ValueError(f"Page {i} rendered to an empty image")
+            pages.append(arr)
+    finally:
+        pdf.close()
+    return pages
+
+
+def _render_page_pillow(data: bytes, page_idx: int) -> np.ndarray:
+    """Fallback: render a single PDF page using Pillow (needs pillow[pdf])."""
+    img = Image.open(io.BytesIO(data))
+    if hasattr(img, "n_frames") and page_idx < img.n_frames:
+        img.seek(page_idx)
+    return np.array(img.convert("RGB"))
+
+
 def _load_document(file: UploadFile) -> list[np.ndarray]:
     """Return a list of numpy arrays (one per page) from image or PDF upload."""
     from doctr.io import DocumentFile
@@ -132,7 +177,8 @@ def _load_document(file: UploadFile) -> list[np.ndarray]:
     name = (file.filename or "").lower()
     logger.info("Loading document: filename=%s, content_type=%s, size=%d bytes", file.filename, ct, len(data))
     if ct == "application/pdf" or name.endswith(".pdf"):
-        return [_ensure_rgb(p) for p in DocumentFile.from_pdf(data)]
+        raw = _read_pdf_safe(data)
+        return [_cap_resolution(_ensure_rgb(p)) for p in raw]
     return DocumentFile.from_images([data])
 
 
