@@ -5,8 +5,11 @@ Exposes all docTR features: OCR, detection, recognition, KIE, and export.
 import base64
 import io
 import logging
+import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Literal
 
 import numpy as np
@@ -139,34 +142,31 @@ def _cap_resolution(arr: np.ndarray) -> np.ndarray:
     return np.array(Image.fromarray(arr).resize((new_w, new_h), Image.LANCZOS))
 
 
-def _read_pdf_safe(data: bytes) -> list[np.ndarray]:
-    """Read PDF pages with pypdfium2, falling back to Pillow on failure."""
-    import pypdfium2 as pdfium
+def _read_pdf_safe(data: bytes, dpi: int = 200) -> list[np.ndarray]:
+    """Render PDF pages to RGB arrays using poppler (pdftoppm) in a subprocess.
 
-    pages: list[np.ndarray] = []
-    pdf = pdfium.PdfDocument(data)
-    try:
-        for i, page in enumerate(pdf):
-            try:
-                bitmap = page.render(scale=2, rev_byteorder=True)
-                arr = bitmap.to_numpy()
-            except Exception:
-                logger.warning("pypdfium2 render failed on page %d, falling back to Pillow", i)
-                arr = _render_page_pillow(data, i)
-            if arr is None or arr.size == 0:
-                raise ValueError(f"Page {i} rendered to an empty image")
-            pages.append(arr)
-    finally:
-        pdf.close()
-    return pages
-
-
-def _render_page_pillow(data: bytes, page_idx: int) -> np.ndarray:
-    """Fallback: render a single PDF page using Pillow (needs pillow[pdf])."""
-    img = Image.open(io.BytesIO(data))
-    if hasattr(img, "n_frames") and page_idx < img.n_frames:
-        img.seek(page_idx)
-    return np.array(img.convert("RGB"))
+    Running in a separate process means a segfault in the renderer
+    cannot kill the API worker (the main cause of 502s on vector PDFs).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = Path(tmp) / "input.pdf"
+        pdf_path.write_bytes(data)
+        out_prefix = Path(tmp) / "page"
+        result = subprocess.run(
+            ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(out_prefix)],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"pdftoppm failed (rc={result.returncode}): {result.stderr.decode(errors='replace')}")
+        page_files = sorted(Path(tmp).glob("page-*.png"))
+        if not page_files:
+            raise RuntimeError("pdftoppm produced no output pages")
+        pages = []
+        for pf in page_files:
+            img = Image.open(pf).convert("RGB")
+            pages.append(np.array(img))
+        logger.info("pdftoppm rendered %d page(s) at %d dpi", len(pages), dpi)
+        return pages
 
 
 def _load_document(file: UploadFile) -> list[np.ndarray]:
