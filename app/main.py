@@ -112,6 +112,18 @@ def _load_image_bytes(data: bytes) -> np.ndarray:
     return np.array(img)
 
 
+def _ensure_rgb(arr: np.ndarray) -> np.ndarray:
+    """Convert a page array to RGB, compositing RGBA onto a white background."""
+    img = Image.fromarray(arr)
+    if img.mode == "RGB":
+        return arr
+    if img.mode == "RGBA":
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[3])
+        return np.array(bg)
+    return np.array(img.convert("RGB"))
+
+
 def _load_document(file: UploadFile) -> list[np.ndarray]:
     """Return a list of numpy arrays (one per page) from image or PDF upload."""
     from doctr.io import DocumentFile
@@ -120,7 +132,7 @@ def _load_document(file: UploadFile) -> list[np.ndarray]:
     name = (file.filename or "").lower()
     logger.info("Loading document: filename=%s, content_type=%s, size=%d bytes", file.filename, ct, len(data))
     if ct == "application/pdf" or name.endswith(".pdf"):
-        return DocumentFile.from_pdf(data)
+        return [_ensure_rgb(p) for p in DocumentFile.from_pdf(data)]
     return DocumentFile.from_images([data])
 
 
