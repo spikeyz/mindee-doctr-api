@@ -3,12 +3,12 @@
 # ──────────────────────────────────────────────────────────────────────────────
 FROM python:3.11-slim AS base
 
+ARG PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DOCTR_CACHE_DIR=/app/.cache/doctr \
-    # Use CPU-only torch to keep image size manageable.
-    # Override PIP_EXTRA_INDEX_URL at build time to pick a CUDA wheel instead.
-    PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
+    PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \

@@ -24,19 +24,36 @@ services:
       retries: 3
       start_period: 60s
 
-  # Optional: GPU-enabled service (requires nvidia-container-toolkit)
-  # doctr-api-gpu:
-  #   build:
-  #     context: .
-  #     args:
-  #       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu121
-  #   image: doctr-api-gpu:latest
-  #   runtime: nvidia
-  #   environment:
-  #     NVIDIA_VISIBLE_DEVICES: all
-  #     WORKERS: "1"
-  #   ports:
-  #     - "8001:8000"
+  doctr-api-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu121
+    image: doctr-api-gpu:latest
+    container_name: doctr-api-gpu
+    ports:
+      - "8001:8000"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      WORKERS: "1"
+      DOCTR_CACHE_DIR: /app/.cache/doctr
+    volumes:
+      - doctr-model-cache:/app/.cache/doctr
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
   doctr-model-cache:

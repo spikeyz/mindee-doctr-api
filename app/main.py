@@ -14,8 +14,24 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from PIL import Image
 
+import torch
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# GPU / device selection
+# ---------------------------------------------------------------------------
+
+def _resolve_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+DEVICE = _resolve_device()
+logger.info("Using device: %s", DEVICE)
 
 # ---------------------------------------------------------------------------
 # Model registry – loaded once and cached per (det_arch, reco_arch) pair
@@ -40,25 +56,50 @@ DEFAULT_DET = "db_resnet50"
 DEFAULT_RECO = "crnn_vgg16_bn"
 
 
+def _to_device(predictor):
+    """Move a predictor's underlying model(s) to the selected device."""
+    if DEVICE.type != "cpu":
+        predictor.to(DEVICE)
+    return predictor
+
+
 def get_ocr_predictor(det_arch: str, reco_arch: str):
     key = (det_arch, reco_arch)
     if key not in _ocr_cache:
-        logger.info("Loading OCR predictor (%s + %s) …", det_arch, reco_arch)
-        _ocr_cache[key] = ocr_predictor(det_arch=det_arch, reco_arch=reco_arch, pretrained=True)
+        logger.info("Loading OCR predictor (%s + %s) on %s …", det_arch, reco_arch, DEVICE)
+        try:
+            _ocr_cache[key] = _to_device(
+                ocr_predictor(det_arch=det_arch, reco_arch=reco_arch, pretrained=True)
+            )
+        except Exception:
+            logger.exception("Failed to load OCR predictor (det=%s, reco=%s, device=%s)", det_arch, reco_arch, DEVICE)
+            raise
     return _ocr_cache[key]
 
 
 def get_det_predictor(det_arch: str):
     if det_arch not in _det_cache:
-        logger.info("Loading detection predictor (%s) …", det_arch)
-        _det_cache[det_arch] = detection_predictor(arch=det_arch, pretrained=True)
+        logger.info("Loading detection predictor (%s) on %s …", det_arch, DEVICE)
+        try:
+            _det_cache[det_arch] = _to_device(
+                detection_predictor(arch=det_arch, pretrained=True)
+            )
+        except Exception:
+            logger.exception("Failed to load detection predictor (arch=%s, device=%s)", det_arch, DEVICE)
+            raise
     return _det_cache[det_arch]
 
 
 def get_reco_predictor(reco_arch: str):
     if reco_arch not in _reco_cache:
-        logger.info("Loading recognition predictor (%s) …", reco_arch)
-        _reco_cache[reco_arch] = recognition_predictor(arch=reco_arch, pretrained=True)
+        logger.info("Loading recognition predictor (%s) on %s …", reco_arch, DEVICE)
+        try:
+            _reco_cache[reco_arch] = _to_device(
+                recognition_predictor(arch=reco_arch, pretrained=True)
+            )
+        except Exception:
+            logger.exception("Failed to load recognition predictor (arch=%s, device=%s)", reco_arch, DEVICE)
+            raise
     return _reco_cache[reco_arch]
 
 
@@ -77,6 +118,7 @@ def _load_document(file: UploadFile) -> list[np.ndarray]:
     data = file.file.read()
     ct = file.content_type or ""
     name = (file.filename or "").lower()
+    logger.info("Loading document: filename=%s, content_type=%s, size=%d bytes", file.filename, ct, len(data))
     if ct == "application/pdf" or name.endswith(".pdf"):
         return DocumentFile.from_pdf(data)
     return DocumentFile.from_images([data])
@@ -146,7 +188,13 @@ app = FastAPI(
 
 @app.get("/health", tags=["system"])
 def health():
-    return {"status": "ok"}
+    gpu_info = {}
+    if DEVICE.type == "cuda":
+        gpu_info = {
+            "gpu_name": torch.cuda.get_device_name(0),
+            "gpu_memory_total_mb": round(torch.cuda.get_device_properties(0).total_mem / 1e6),
+        }
+    return {"status": "ok", "device": str(DEVICE), **gpu_info}
 
 
 @app.get("/models", tags=["system"])
@@ -155,6 +203,7 @@ def list_models():
     return {
         "detection": DETECTION_MODELS,
         "recognition": RECOGNITION_MODELS,
+        "device": str(DEVICE),
         "defaults": {"detection": DEFAULT_DET, "recognition": DEFAULT_RECO},
         "loaded": {
             "ocr": list(_ocr_cache.keys()),
@@ -183,12 +232,25 @@ async def ocr(
     try:
         pages = _load_document(file)
     except Exception as e:
+        logger.exception("OCR – failed to load document (filename=%s)", file.filename)
         raise HTTPException(400, f"Could not read file: {e}")
 
-    predictor = get_ocr_predictor(det_arch, reco_arch)
-    doc = predictor(pages)
+    try:
+        predictor = get_ocr_predictor(det_arch, reco_arch)
+        doc = predictor(pages)
+    except Exception as e:
+        logger.exception(
+            "OCR – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
+            det_arch, reco_arch, len(pages), DEVICE,
+        )
+        raise HTTPException(500, f"OCR inference failed: {e}")
 
-    result = _doc_to_dict(doc)
+    try:
+        result = _doc_to_dict(doc)
+    except Exception as e:
+        logger.exception("OCR – failed to serialise results (det=%s, reco=%s)", det_arch, reco_arch)
+        raise HTTPException(500, f"Result serialisation failed: {e}")
+
     result["meta"] = {
         "det_arch": det_arch,
         "reco_arch": reco_arch,
@@ -204,6 +266,7 @@ async def ocr(
             for p in pages
         ]
 
+    logger.info("OCR – done in %.3fs (det=%s, reco=%s, pages=%d)", time.perf_counter() - t0, det_arch, reco_arch, len(pages))
     return result
 
 
@@ -222,21 +285,31 @@ async def detect(
     try:
         pages = _load_document(file)
     except Exception as e:
+        logger.exception("Detect – failed to load document (filename=%s)", file.filename)
         raise HTTPException(400, f"Could not read file: {e}")
 
-    predictor = get_det_predictor(det_arch)
-    result = predictor(pages)
+    try:
+        predictor = get_det_predictor(det_arch)
+        result = predictor(pages)
+    except Exception as e:
+        logger.exception("Detect – inference failed (det=%s, num_pages=%d, device=%s)", det_arch, len(pages), DEVICE)
+        raise HTTPException(500, f"Detection inference failed: {e}")
 
-    pages_out = []
-    for page_idx, page_result in enumerate(result.pages):
-        regions = []
-        for block in page_result.blocks:
-            region: dict = {"geometry": block.geometry}
-            if include_confidence:
-                region["confidence"] = round(float(block.objectness_score), 4)
-            regions.append(region)
-        pages_out.append({"page_idx": page_idx, "regions": regions})
+    try:
+        pages_out = []
+        for page_idx, page_result in enumerate(result.pages):
+            regions = []
+            for block in page_result.blocks:
+                region: dict = {"geometry": block.geometry}
+                if include_confidence:
+                    region["confidence"] = round(float(block.objectness_score), 4)
+                regions.append(region)
+            pages_out.append({"page_idx": page_idx, "regions": regions})
+    except Exception as e:
+        logger.exception("Detect – failed to serialise results (det=%s)", det_arch)
+        raise HTTPException(500, f"Result serialisation failed: {e}")
 
+    logger.info("Detect – done in %.3fs (det=%s, pages=%d)", time.perf_counter() - t0, det_arch, len(pages))
     return {
         "det_arch": det_arch,
         "num_pages": len(pages),
@@ -261,11 +334,17 @@ async def recognize(
         data = file.file.read()
         img = _load_image_bytes(data)
     except Exception as e:
+        logger.exception("Recognize – failed to load image (filename=%s, size=%d bytes)", file.filename, len(data) if 'data' in dir() else -1)
         raise HTTPException(400, f"Could not read image: {e}")
 
-    predictor = get_reco_predictor(reco_arch)
-    words, confs = predictor([img])
+    try:
+        predictor = get_reco_predictor(reco_arch)
+        words, confs = predictor([img])
+    except Exception as e:
+        logger.exception("Recognize – inference failed (reco=%s, img_shape=%s, device=%s)", reco_arch, img.shape, DEVICE)
+        raise HTTPException(500, f"Recognition inference failed: {e}")
 
+    logger.info("Recognize – done in %.3fs (reco=%s)", time.perf_counter() - t0, reco_arch)
     return {
         "reco_arch": reco_arch,
         "elapsed_s": round(time.perf_counter() - t0, 3),
@@ -294,18 +373,31 @@ async def kie(
     try:
         pages = _load_document(file)
     except Exception as e:
+        logger.exception("KIE – failed to load document (filename=%s)", file.filename)
         raise HTTPException(400, f"Could not read file: {e}")
 
-    predictor = kie_predictor(det_arch=det_arch, reco_arch=reco_arch, pretrained=True)
-    doc = predictor(pages)
+    try:
+        predictor = kie_predictor(det_arch=det_arch, reco_arch=reco_arch, pretrained=True)
+        doc = predictor(pages)
+    except Exception as e:
+        logger.exception(
+            "KIE – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
+            det_arch, reco_arch, len(pages), DEVICE,
+        )
+        raise HTTPException(500, f"KIE inference failed: {e}")
 
-    pages_out = []
-    for page in doc.pages:
-        predictions: dict[str, list] = {}
-        for class_name, words in page.predictions.items():
-            predictions[class_name] = [_word_to_dict(w) for w in words]
-        pages_out.append({"page_idx": page.page_idx, "predictions": predictions})
+    try:
+        pages_out = []
+        for page in doc.pages:
+            predictions: dict[str, list] = {}
+            for class_name, words in page.predictions.items():
+                predictions[class_name] = [_word_to_dict(w) for w in words]
+            pages_out.append({"page_idx": page.page_idx, "predictions": predictions})
+    except Exception as e:
+        logger.exception("KIE – failed to serialise results (det=%s, reco=%s)", det_arch, reco_arch)
+        raise HTTPException(500, f"Result serialisation failed: {e}")
 
+    logger.info("KIE – done in %.3fs (det=%s, reco=%s, pages=%d)", time.perf_counter() - t0, det_arch, reco_arch, len(pages))
     return {
         "det_arch": det_arch,
         "reco_arch": reco_arch,
@@ -330,11 +422,21 @@ async def export_text(
     try:
         pages = _load_document(file)
     except Exception as e:
+        logger.exception("Export/text – failed to load document (filename=%s)", file.filename)
         raise HTTPException(400, f"Could not read file: {e}")
 
-    predictor = get_ocr_predictor(det_arch, reco_arch)
-    doc = predictor(pages)
-    text = doc.render()
+    try:
+        predictor = get_ocr_predictor(det_arch, reco_arch)
+        doc = predictor(pages)
+        text = doc.render()
+    except Exception as e:
+        logger.exception(
+            "Export/text – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
+            det_arch, reco_arch, len(pages), DEVICE,
+        )
+        raise HTTPException(500, f"Text export failed: {e}")
+
+    logger.info("Export/text – done (det=%s, reco=%s, pages=%d)", det_arch, reco_arch, len(pages))
     return Response(content=text, media_type="text/plain")
 
 
@@ -353,11 +455,21 @@ async def export_hocr(
     try:
         pages = _load_document(file)
     except Exception as e:
+        logger.exception("Export/hOCR – failed to load document (filename=%s)", file.filename)
         raise HTTPException(400, f"Could not read file: {e}")
 
-    predictor = get_ocr_predictor(det_arch, reco_arch)
-    doc = predictor(pages)
-    hocr = doc.export_as_xml()
+    try:
+        predictor = get_ocr_predictor(det_arch, reco_arch)
+        doc = predictor(pages)
+        hocr = doc.export_as_xml()
+    except Exception as e:
+        logger.exception(
+            "Export/hOCR – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
+            det_arch, reco_arch, len(pages), DEVICE,
+        )
+        raise HTTPException(500, f"hOCR export failed: {e}")
+
+    logger.info("Export/hOCR – done (det=%s, reco=%s, pages=%d)", det_arch, reco_arch, len(pages))
     return Response(content=hocr, media_type="application/xml")
 
 
@@ -379,16 +491,29 @@ async def export_searchable_pdf(
         file.file.seek(0)
         pdf_bytes = file.file.read()
     except Exception as e:
+        logger.exception("Export/searchable-pdf – failed to load document (filename=%s)", file.filename)
         raise HTTPException(400, f"Could not read file: {e}")
 
-    predictor = get_ocr_predictor(det_arch, reco_arch)
-    doc = predictor(pages)
+    try:
+        predictor = get_ocr_predictor(det_arch, reco_arch)
+        doc = predictor(pages)
+    except Exception as e:
+        logger.exception(
+            "Export/searchable-pdf – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
+            det_arch, reco_arch, len(pages), DEVICE,
+        )
+        raise HTTPException(500, f"OCR inference failed: {e}")
 
     try:
         out_pdf = doc.export_as_pdf(pdf_bytes)
     except Exception as e:
+        logger.exception(
+            "Export/searchable-pdf – PDF generation failed (det=%s, reco=%s, num_pages=%d)",
+            det_arch, reco_arch, len(pages),
+        )
         raise HTTPException(500, f"PDF export failed: {e}")
 
+    logger.info("Export/searchable-pdf – done (det=%s, reco=%s, pages=%d)", det_arch, reco_arch, len(pages))
     return Response(
         content=out_pdf,
         media_type="application/pdf",
@@ -411,15 +536,22 @@ async def visualize(
     try:
         pages = _load_document(file)
     except Exception as e:
+        logger.exception("Visualize – failed to load document (filename=%s)", file.filename)
         raise HTTPException(400, f"Could not read file: {e}")
 
     if page_idx >= len(pages):
         raise HTTPException(400, f"page_idx {page_idx} out of range (doc has {len(pages)} pages)")
 
-    predictor = get_ocr_predictor(det_arch, reco_arch)
-    doc = predictor(pages)
+    try:
+        predictor = get_ocr_predictor(det_arch, reco_arch)
+        doc = predictor(pages)
+    except Exception as e:
+        logger.exception(
+            "Visualize – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
+            det_arch, reco_arch, len(pages), DEVICE,
+        )
+        raise HTTPException(500, f"OCR inference failed: {e}")
 
-    # docTR's show() renders to matplotlib; use export instead
     page = doc.pages[page_idx]
     try:
         from doctr.utils.visualization import visualize_page
@@ -432,8 +564,13 @@ async def visualize(
         fig.savefig(buf, format="png", bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
+        logger.info("Visualize – done (det=%s, reco=%s, page_idx=%d)", det_arch, reco_arch, page_idx)
         return Response(content=buf.read(), media_type="image/png")
     except Exception as e:
+        logger.exception(
+            "Visualize – rendering failed (det=%s, reco=%s, page_idx=%d)",
+            det_arch, reco_arch, page_idx,
+        )
         raise HTTPException(500, f"Visualization failed: {e}")
 
 
