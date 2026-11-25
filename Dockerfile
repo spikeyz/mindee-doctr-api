@@ -53,10 +53,23 @@ COPY app/ ./app/
 EXPOSE 8000
 
 # Number of uvicorn workers can be tuned via WORKERS env var.
+# Keep 1 worker per GPU: concurrency is handled by a thread pool + MAX_CONCURRENT_INFERENCE.
 ENV WORKERS=1
+
+# CPU threads: set to the pod's CPU quota (os.cpu_count() sees the whole node).
+# OMP_WAIT_POLICY=PASSIVE stops idle OpenMP threads from busy-spinning.
+ENV OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    OPENBLAS_NUM_THREADS=4 \
+    OMP_WAIT_POLICY=PASSIVE \
+    MAX_CONCURRENT_INFERENCE=2 \
+    PDF_DPI=200 \
+    REQUIRE_GPU=0
 
 CMD uvicorn app.main:app \
         --host 0.0.0.0 \
         --port 8000 \
         --workers ${WORKERS} \
+        --timeout-keep-alive 65 \
+        --timeout-graceful-shutdown 30 \
         --log-level info

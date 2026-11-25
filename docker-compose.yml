@@ -37,9 +37,12 @@ services:
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       WORKERS: "1"
+      REQUIRE_GPU: "1"
       DOCTR_CACHE_DIR: /app/.cache/doctr
     volumes:
       - doctr-model-cache:/app/.cache/doctr
+      # Uncomment to test code changes without rebuilding:
+      # - ./app:/app/app:ro
     deploy:
       resources:
         reservations:

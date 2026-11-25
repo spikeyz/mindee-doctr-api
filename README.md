@@ -133,8 +133,16 @@ curl -X POST http://localhost:8000/visualize \
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `WORKERS` | `1` | Number of uvicorn workers |
+| `WORKERS` | `1` | Number of uvicorn workers (keep 1 per GPU) |
 | `DOCTR_CACHE_DIR` | `/app/.cache/doctr` | Model weight cache directory |
+| `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` | `4` | CPU threads – set to the pod's CPU quota |
+| `CPU_THREADS` | `OMP_NUM_THREADS` | Threads for `torch.set_num_threads` and OpenCV |
+| `OMP_WAIT_POLICY` | `PASSIVE` | Idle OpenMP threads sleep instead of spinning |
+| `MAX_CONCURRENT_INFERENCE` | `2` | Max simultaneous inferences (other requests wait) |
+| `PDF_DPI` | `200` | PDF rendering resolution (150 is faster) |
+| `REQUIRE_GPU` | `0` | `1` = fail at startup if CUDA is unavailable instead of silently using CPU |
+
+Responses are gzip-compressed when the client sends `Accept-Encoding: gzip` (`curl --compressed`; `requests` does it by default).
 
 ## Project structure
 

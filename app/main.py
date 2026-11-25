@@ -5,22 +5,56 @@ Exposes all docTR features: OCR, detection, recognition, KIE, and export.
 import base64
 import io
 import logging
+import os
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import Response
 from PIL import Image
 
+import cv2
 import torch
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Runtime tuning (env vars)
+# ---------------------------------------------------------------------------
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, default)))
+    except ValueError:
+        return default
+
+
+# Dans un pod, os.cpu_count() renvoie les cœurs du nœud, pas le quota du pod :
+# sans limite, torch/OpenMP/OpenCV créent un thread par cœur hôte (sur-souscription).
+CPU_THREADS = _env_int("CPU_THREADS", _env_int("OMP_NUM_THREADS", 4))
+# Nombre max d'inférences simultanées (protège la VRAM et le predictor partagé).
+MAX_CONCURRENT_INFERENCE = _env_int("MAX_CONCURRENT_INFERENCE", 2)
+# Résolution de rendu des PDF.
+PDF_DPI = _env_int("PDF_DPI", 200)
+# Si vrai, le démarrage échoue quand CUDA est absent au lieu de basculer en CPU.
+REQUIRE_GPU = os.getenv("REQUIRE_GPU", "0").lower() in ("1", "true", "yes")
+
+torch.set_num_threads(CPU_THREADS)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:  # déjà fixé si torch a été initialisé avant
+    pass
+cv2.setNumThreads(CPU_THREADS)
+
+_inference_slots = threading.BoundedSemaphore(MAX_CONCURRENT_INFERENCE)
+_load_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # GPU / device selection
@@ -29,21 +63,28 @@ logger = logging.getLogger(__name__)
 def _resolve_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if REQUIRE_GPU:
+        raise RuntimeError("REQUIRE_GPU=1 mais CUDA est indisponible (torch %s, cuda %s)"
+                           % (torch.__version__, torch.version.cuda))
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
 DEVICE = _resolve_device()
-logger.info("Using device: %s", DEVICE)
+logger.info(
+    "Using device: %s | cpu_threads=%d | max_concurrent_inference=%d | pdf_dpi=%d",
+    DEVICE, CPU_THREADS, MAX_CONCURRENT_INFERENCE, PDF_DPI,
+)
 
 # ---------------------------------------------------------------------------
 # Model registry – loaded once and cached per (det_arch, reco_arch) pair
 # ---------------------------------------------------------------------------
-from doctr.models import detection_predictor, ocr_predictor, recognition_predictor
+from doctr.models import detection_predictor, kie_predictor, ocr_predictor, recognition_predictor
 
 _ocr_cache: dict = {}
 _det_cache: dict = {}
 _reco_cache: dict = {}
+_kie_cache: dict = {}
 
 DETECTION_MODELS = [
     "db_resnet34", "db_resnet50", "db_mobilenet_v3_large",
@@ -66,44 +107,45 @@ def _to_device(predictor):
     return predictor
 
 
+def _get_cached(cache: dict, key, label: str, factory):
+    """Load a predictor once (thread-safe: routes now run in a thread pool)."""
+    if key in cache:
+        return cache[key]
+    with _load_lock:
+        if key not in cache:
+            logger.info("Loading %s predictor %s on %s …", label, key, DEVICE)
+            try:
+                cache[key] = _to_device(factory())
+            except Exception:
+                logger.exception("Failed to load %s predictor %s (device=%s)", label, key, DEVICE)
+                raise
+    return cache[key]
+
+
 def get_ocr_predictor(det_arch: str, reco_arch: str):
-    key = (det_arch, reco_arch)
-    if key not in _ocr_cache:
-        logger.info("Loading OCR predictor (%s + %s) on %s …", det_arch, reco_arch, DEVICE)
-        try:
-            _ocr_cache[key] = _to_device(
-                ocr_predictor(det_arch=det_arch, reco_arch=reco_arch, pretrained=True)
-            )
-        except Exception:
-            logger.exception("Failed to load OCR predictor (det=%s, reco=%s, device=%s)", det_arch, reco_arch, DEVICE)
-            raise
-    return _ocr_cache[key]
+    return _get_cached(_ocr_cache, (det_arch, reco_arch), "OCR",
+                       lambda: ocr_predictor(det_arch=det_arch, reco_arch=reco_arch, pretrained=True))
 
 
 def get_det_predictor(det_arch: str):
-    if det_arch not in _det_cache:
-        logger.info("Loading detection predictor (%s) on %s …", det_arch, DEVICE)
-        try:
-            _det_cache[det_arch] = _to_device(
-                detection_predictor(arch=det_arch, pretrained=True)
-            )
-        except Exception:
-            logger.exception("Failed to load detection predictor (arch=%s, device=%s)", det_arch, DEVICE)
-            raise
-    return _det_cache[det_arch]
+    return _get_cached(_det_cache, det_arch, "detection",
+                       lambda: detection_predictor(arch=det_arch, pretrained=True))
 
 
 def get_reco_predictor(reco_arch: str):
-    if reco_arch not in _reco_cache:
-        logger.info("Loading recognition predictor (%s) on %s …", reco_arch, DEVICE)
-        try:
-            _reco_cache[reco_arch] = _to_device(
-                recognition_predictor(arch=reco_arch, pretrained=True)
-            )
-        except Exception:
-            logger.exception("Failed to load recognition predictor (arch=%s, device=%s)", reco_arch, DEVICE)
-            raise
-    return _reco_cache[reco_arch]
+    return _get_cached(_reco_cache, reco_arch, "recognition",
+                       lambda: recognition_predictor(arch=reco_arch, pretrained=True))
+
+
+def get_kie_predictor(det_arch: str, reco_arch: str):
+    return _get_cached(_kie_cache, (det_arch, reco_arch), "KIE",
+                       lambda: kie_predictor(det_arch=det_arch, reco_arch=reco_arch, pretrained=True))
+
+
+def _infer(predictor, inputs):
+    """Run inference with a bound on concurrent GPU work."""
+    with _inference_slots:
+        return predictor(inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -142,23 +184,24 @@ def _cap_resolution(arr: np.ndarray) -> np.ndarray:
     return np.array(Image.fromarray(arr).resize((new_w, new_h), Image.LANCZOS))
 
 
-def _read_pdf_safe(data: bytes, dpi: int = 200) -> list[np.ndarray]:
+def _read_pdf_safe(data: bytes, dpi: int = PDF_DPI) -> list[np.ndarray]:
     """Render PDF pages to RGB arrays using poppler (pdftoppm) in a subprocess.
 
     Running in a separate process means a segfault in the renderer
     cannot kill the API worker (the main cause of 502s on vector PDFs).
+    Output is uncompressed PPM: ~2x faster than PNG (no zlib encode/decode).
     """
     with tempfile.TemporaryDirectory() as tmp:
         pdf_path = Path(tmp) / "input.pdf"
         pdf_path.write_bytes(data)
         out_prefix = Path(tmp) / "page"
         result = subprocess.run(
-            ["pdftoppm", "-png", "-r", str(dpi), str(pdf_path), str(out_prefix)],
+            ["pdftoppm", "-r", str(dpi), str(pdf_path), str(out_prefix)],
             capture_output=True, timeout=60,
         )
         if result.returncode != 0:
             raise RuntimeError(f"pdftoppm failed (rc={result.returncode}): {result.stderr.decode(errors='replace')}")
-        page_files = sorted(Path(tmp).glob("page-*.png"))
+        page_files = sorted(Path(tmp).glob("page-*.ppm"))
         if not page_files:
             raise RuntimeError("pdftoppm produced no output pages")
         pages = []
@@ -178,7 +221,7 @@ def _load_document(file: UploadFile) -> list[np.ndarray]:
     logger.info("Loading document: filename=%s, content_type=%s, size=%d bytes", file.filename, ct, len(data))
     if ct == "application/pdf" or name.endswith(".pdf"):
         raw = _read_pdf_safe(data)
-        return [_cap_resolution(_ensure_rgb(p)) for p in raw]
+        return [_cap_resolution(p) for p in raw]  # déjà RGB (convert dans _read_pdf_safe)
     return DocumentFile.from_images([data])
 
 
@@ -238,6 +281,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+# Compresse les réponses JSON volumineuses (si le client envoie Accept-Encoding: gzip).
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +312,7 @@ def list_models():
             "ocr": list(_ocr_cache.keys()),
             "detection": list(_det_cache.keys()),
             "recognition": list(_reco_cache.keys()),
+            "kie": list(_kie_cache.keys()),
         },
     }
 
@@ -274,7 +320,7 @@ def list_models():
 # ── OCR ──────────────────────────────────────────────────────────────────────
 
 @app.post("/ocr", tags=["ocr"])
-async def ocr(
+def ocr(
     file: UploadFile = File(..., description="Image (JPEG/PNG) or PDF"),
     det_arch: str = Query(DEFAULT_DET, enum=DETECTION_MODELS),
     reco_arch: str = Query(DEFAULT_RECO, enum=RECOGNITION_MODELS),
@@ -295,7 +341,7 @@ async def ocr(
 
     try:
         predictor = get_ocr_predictor(det_arch, reco_arch)
-        doc = predictor(pages)
+        doc = _infer(predictor, pages)
     except Exception as e:
         logger.exception(
             "OCR – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
@@ -331,7 +377,7 @@ async def ocr(
 # ── Detection ─────────────────────────────────────────────────────────────────
 
 @app.post("/detect", tags=["detection"])
-async def detect(
+def detect(
     file: UploadFile = File(..., description="Image (JPEG/PNG) or PDF"),
     det_arch: str = Query(DEFAULT_DET, enum=DETECTION_MODELS),
     include_confidence: bool = Query(True),
@@ -348,20 +394,30 @@ async def detect(
 
     try:
         predictor = get_det_predictor(det_arch)
-        result = predictor(pages)
+        result = _infer(predictor, pages)
     except Exception as e:
         logger.exception("Detect – inference failed (det=%s, num_pages=%d, device=%s)", det_arch, len(pages), DEVICE)
         raise HTTPException(500, f"Detection inference failed: {e}")
 
     try:
+        # docTR >= 0.8 : une liste (une entrée par page) de {class_name: ndarray}.
+        # Boîtes droites : (N, 5) = xmin, ymin, xmax, ymax, score (coordonnées relatives)
+        # Boîtes orientées : (N, 5, 2) = 4 points + ligne score.
         pages_out = []
-        for page_idx, page_result in enumerate(result.pages):
+        for page_idx, page_result in enumerate(result):
             regions = []
-            for block in page_result.blocks:
-                region: dict = {"geometry": block.geometry}
-                if include_confidence:
-                    region["confidence"] = round(float(block.objectness_score), 4)
-                regions.append(region)
+            for class_name, boxes in page_result.items():
+                for box in np.asarray(boxes):
+                    if box.ndim == 1:
+                        geometry = ((float(box[0]), float(box[1])), (float(box[2]), float(box[3])))
+                        score = float(box[4])
+                    else:
+                        geometry = tuple((float(x), float(y)) for x, y in box[:4])
+                        score = float(box[4][0])
+                    region: dict = {"geometry": geometry, "class": class_name}
+                    if include_confidence:
+                        region["confidence"] = round(score, 4)
+                    regions.append(region)
             pages_out.append({"page_idx": page_idx, "regions": regions})
     except Exception as e:
         logger.exception("Detect – failed to serialise results (det=%s)", det_arch)
@@ -379,7 +435,7 @@ async def detect(
 # ── Recognition ──────────────────────────────────────────────────────────────
 
 @app.post("/recognize", tags=["recognition"])
-async def recognize(
+def recognize(
     file: UploadFile = File(..., description="Cropped word image (JPEG/PNG)"),
     reco_arch: str = Query(DEFAULT_RECO, enum=RECOGNITION_MODELS),
 ):
@@ -397,7 +453,7 @@ async def recognize(
 
     try:
         predictor = get_reco_predictor(reco_arch)
-        words, confs = predictor([img])
+        preds = _infer(predictor, [img])  # docTR 0.10 : [(value, confidence), ...]
     except Exception as e:
         logger.exception("Recognize – inference failed (reco=%s, img_shape=%s, device=%s)", reco_arch, img.shape, DEVICE)
         raise HTTPException(500, f"Recognition inference failed: {e}")
@@ -408,7 +464,7 @@ async def recognize(
         "elapsed_s": round(time.perf_counter() - t0, 3),
         "results": [
             {"value": w, "confidence": round(float(c), 4)}
-            for w, c in zip(words, confs)
+            for w, c in preds
         ],
     }
 
@@ -416,7 +472,7 @@ async def recognize(
 # ── KIE (Key Information Extraction) ─────────────────────────────────────────
 
 @app.post("/kie", tags=["kie"])
-async def kie(
+def kie(
     file: UploadFile = File(..., description="Image (JPEG/PNG) or PDF"),
     det_arch: str = Query(DEFAULT_DET, enum=DETECTION_MODELS),
     reco_arch: str = Query(DEFAULT_RECO, enum=RECOGNITION_MODELS),
@@ -425,8 +481,6 @@ async def kie(
     **Key Information Extraction** – uses the KIE predictor for multi-class
     detection and returns class-labelled word regions.
     """
-    from doctr.models import kie_predictor
-
     t0 = time.perf_counter()
     try:
         pages = _load_document(file)
@@ -435,8 +489,8 @@ async def kie(
         raise HTTPException(400, f"Could not read file: {e}")
 
     try:
-        predictor = kie_predictor(det_arch=det_arch, reco_arch=reco_arch, pretrained=True)
-        doc = predictor(pages)
+        predictor = get_kie_predictor(det_arch, reco_arch)
+        doc = _infer(predictor, pages)
     except Exception as e:
         logger.exception(
             "KIE – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
@@ -468,7 +522,7 @@ async def kie(
 # ── Export: plain text ────────────────────────────────────────────────────────
 
 @app.post("/export/text", tags=["export"])
-async def export_text(
+def export_text(
     file: UploadFile = File(...),
     det_arch: str = Query(DEFAULT_DET, enum=DETECTION_MODELS),
     reco_arch: str = Query(DEFAULT_RECO, enum=RECOGNITION_MODELS),
@@ -485,7 +539,7 @@ async def export_text(
 
     try:
         predictor = get_ocr_predictor(det_arch, reco_arch)
-        doc = predictor(pages)
+        doc = _infer(predictor, pages)
         text = doc.render()
     except Exception as e:
         logger.exception(
@@ -501,7 +555,7 @@ async def export_text(
 # ── Export: hOCR (XML) ────────────────────────────────────────────────────────
 
 @app.post("/export/hocr", tags=["export"])
-async def export_hocr(
+def export_hocr(
     file: UploadFile = File(...),
     det_arch: str = Query(DEFAULT_DET, enum=DETECTION_MODELS),
     reco_arch: str = Query(DEFAULT_RECO, enum=RECOGNITION_MODELS),
@@ -518,7 +572,7 @@ async def export_hocr(
 
     try:
         predictor = get_ocr_predictor(det_arch, reco_arch)
-        doc = predictor(pages)
+        doc = _infer(predictor, pages)
         hocr = doc.export_as_xml()
     except Exception as e:
         logger.exception(
@@ -534,7 +588,7 @@ async def export_hocr(
 # ── Export: searchable PDF ────────────────────────────────────────────────────
 
 @app.post("/export/searchable-pdf", tags=["export"])
-async def export_searchable_pdf(
+def export_searchable_pdf(
     file: UploadFile = File(...),
     det_arch: str = Query(DEFAULT_DET, enum=DETECTION_MODELS),
     reco_arch: str = Query(DEFAULT_RECO, enum=RECOGNITION_MODELS),
@@ -554,7 +608,7 @@ async def export_searchable_pdf(
 
     try:
         predictor = get_ocr_predictor(det_arch, reco_arch)
-        doc = predictor(pages)
+        doc = _infer(predictor, pages)
     except Exception as e:
         logger.exception(
             "Export/searchable-pdf – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
@@ -582,7 +636,7 @@ async def export_searchable_pdf(
 # ── Visualise ─────────────────────────────────────────────────────────────────
 
 @app.post("/visualize", tags=["debug"])
-async def visualize(
+def visualize(
     file: UploadFile = File(..., description="Single-page image (JPEG/PNG)"),
     det_arch: str = Query(DEFAULT_DET, enum=DETECTION_MODELS),
     reco_arch: str = Query(DEFAULT_RECO, enum=RECOGNITION_MODELS),
@@ -602,7 +656,7 @@ async def visualize(
 
     try:
         predictor = get_ocr_predictor(det_arch, reco_arch)
-        doc = predictor(pages)
+        doc = _infer(predictor, pages)
     except Exception as e:
         logger.exception(
             "Visualize – inference failed (det=%s, reco=%s, num_pages=%d, device=%s)",
@@ -630,6 +684,93 @@ async def visualize(
             det_arch, reco_arch, page_idx,
         )
         raise HTTPException(500, f"Visualization failed: {e}")
+
+
+# ── Debug / diagnostic ────────────────────────────────────────────────────────
+
+@app.post("/debug/pdf", tags=["debug"])
+def debug_pdf(
+    file: UploadFile = File(..., description="PDF to diagnose"),
+    det_arch: str = Query(DEFAULT_DET, enum=DETECTION_MODELS),
+    reco_arch: str = Query(DEFAULT_RECO, enum=RECOGNITION_MODELS),
+):
+    """Step-by-step PDF processing diagnostic – returns where it fails."""
+    import traceback as tb
+
+    report: dict = {"filename": file.filename, "steps": {}}
+    data = file.file.read()
+    report["file_size_bytes"] = len(data)
+
+    # Step 1 – pdftoppm render
+    try:
+        t0 = time.perf_counter()
+        raw = _read_pdf_safe(data)
+        report["steps"]["1_pdftoppm"] = {
+            "status": "ok",
+            "num_pages": len(raw),
+            "page_shapes": [p.shape for p in raw],
+            "page_dtypes": [str(p.dtype) for p in raw],
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+    except Exception as e:
+        report["steps"]["1_pdftoppm"] = {"status": "FAILED", "error": tb.format_exc()}
+        return report
+
+    # Step 2 – RGB conversion + resolution cap
+    try:
+        t0 = time.perf_counter()
+        pages = [_cap_resolution(_ensure_rgb(p)) for p in raw]
+        report["steps"]["2_rgb_cap"] = {
+            "status": "ok",
+            "page_shapes": [p.shape for p in pages],
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+    except Exception as e:
+        report["steps"]["2_rgb_cap"] = {"status": "FAILED", "error": tb.format_exc()}
+        return report
+
+    # Step 3 – load model
+    try:
+        t0 = time.perf_counter()
+        predictor = get_ocr_predictor(det_arch, reco_arch)
+        report["steps"]["3_model_load"] = {
+            "status": "ok",
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+    except Exception as e:
+        report["steps"]["3_model_load"] = {"status": "FAILED", "error": tb.format_exc()}
+        return report
+
+    # Step 4 – inference
+    try:
+        t0 = time.perf_counter()
+        doc = _infer(predictor, pages)
+        report["steps"]["4_inference"] = {
+            "status": "ok",
+            "num_words": sum(
+                len(w)
+                for p in doc.pages for b in p.blocks for l in b.lines for w in [l.words]
+            ),
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+    except Exception as e:
+        report["steps"]["4_inference"] = {"status": "FAILED", "error": tb.format_exc()}
+        return report
+
+    # Step 5 – serialisation
+    try:
+        t0 = time.perf_counter()
+        result = _doc_to_dict(doc)
+        report["steps"]["5_serialise"] = {
+            "status": "ok",
+            "elapsed_s": round(time.perf_counter() - t0, 3),
+        }
+    except Exception as e:
+        report["steps"]["5_serialise"] = {"status": "FAILED", "error": tb.format_exc()}
+        return report
+
+    report["overall"] = "ALL STEPS OK"
+    return report
 
 
 # ---------------------------------------------------------------------------

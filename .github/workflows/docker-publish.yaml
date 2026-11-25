@@ -23,6 +23,8 @@ jobs:
           push: true
           build-args: |
             PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121
+          # Immutable per-commit tag kept for rollbacks (gpu/latest are overwritten on every push).
           tags: |
             spikeyz/mindee-doctr-api:gpu
             spikeyz/mindee-doctr-api:latest
+            spikeyz/mindee-doctr-api:gpu-${{ github.sha }}
